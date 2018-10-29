@@ -1,0 +1,144 @@
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
+	typev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/clientcmd"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+func main() {
+	// Handling User input
+	flag.Usage = func() {
+		fmt.Printf("Usage: \n sudo ./alktrace [options] <domain/ip> \nOptions:\n")
+		flag.PrintDefaults()
+	}
+	protoToUse := flag.String("proto", "", "Set the protocol to use. By default use udp on Linux. \n Can be tcp, icmp")
+	portDest := flag.String("p", "80", "Set the destination port to use")
+	kconfig := flag.String("kconf", filepath.Join(os.Getenv("HOME"), ".kube", "config"), "Path to the kubeconfig. Defaults to ~/.kube/config")
+	namespace := flag.String("ns", "", "Specify the namespace in which the service reside. Seeks into all namespaces by default")
+	svcName := flag.String("svc", "", "Specify the service name for which you want more infos")
+	flag.Parse()
+	if flag.NArg() != 1 {
+		flag.Usage()
+		return
+	}
+	host := dns(flag.Args()[0])
+	proto := proto(*protoToUse)
+	//	if *kconfig == "" {
+	//		*kconfig = filepath.Join(
+	//			os.Getenv("HOME"), ".kube", "config",
+	//		)
+	//	}
+
+	// Trace to the dest given
+	trace(host, proto, *portDest)
+
+	if *svcName != "" {
+		// Get all infos from k8s about the destination
+		getK8sInfos(*kconfig, host, *svcName, *namespace)
+	}
+}
+
+func dns(host string) string {
+	addresses, err := net.LookupHost(host)
+	if err != nil {
+		fmt.Println(err)
+		panic(err)
+	}
+	return addresses[0]
+}
+
+func proto(proto string) string {
+	switch proto {
+	case "tcp":
+		return "-T"
+	case "icmp":
+		return "-I"
+	default:
+		return ""
+	}
+}
+
+func trace(host string, proto string, port string) {
+	result, err := exec.Command("sudo", "traceroute", "-w", "1", "-p", "1", proto, "-p", port, host).Output()
+	if err != nil {
+		fmt.Println(err)
+		fmt.Fprintln(os.Stdout, "Please check that you have traceroute (not the one from inetutils which is not powerful enough)")
+		fmt.Fprintln(os.Stdout, "Please check also your firewall rules")
+		return
+	}
+	fmt.Fprintf(os.Stdout, "%s", result)
+}
+
+func getK8sInfos(kconfig string, host string, svcName string, namespace string) {
+	//fmt.Fprintf(os.Stdout, "Using config from : %s\n", kconfig)
+	k8sClient, err := getClient(kconfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	svc, err := getServiceForDeployment(svcName, namespace, k8sClient)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+
+	pods, err := getPodsForSvc(svc, namespace, k8sClient)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	for _, pod := range pods.Items {
+		fmt.Fprintf(os.Stdout, "    %v (%v) on Node : %v \n", pod.Name, pod.Status.PodIP, pod.Status.HostIP)
+	}
+}
+
+func getClient(configLocation string) (typev1.CoreV1Interface, error) {
+	kubeconfig := filepath.Clean(configLocation)
+	//fmt.Fprintf(os.Stdout, "Cleaned location : %s\n", kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+	//fmt.Fprintf(os.Stdout, "Config built: %v\n", config)
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	return clientset.CoreV1(), nil
+}
+
+func getServiceForDeployment(deployment string, namespace string, k8sClient typev1.CoreV1Interface) (*corev1.Service, error) {
+	listOptions := metav1.ListOptions{}
+	svcs, err := k8sClient.Services(namespace).List(listOptions)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, svc := range svcs.Items {
+		if strings.Contains(svc.Name, deployment) {
+			fmt.Fprintf(os.Stdout, "\n The service reached (%v) serves the pods : \n", svc.Name)
+			return &svc, nil
+		}
+	}
+	return nil, errors.New("cannot find service for deployment")
+}
+
+func getPodsForSvc(svc *corev1.Service, namespace string, k8sClient typev1.CoreV1Interface) (*corev1.PodList, error) {
+	set := labels.Set(svc.Spec.Selector)
+	listOptions := metav1.ListOptions{LabelSelector: set.AsSelector().String()}
+	pods, err := k8sClient.Pods(namespace).List(listOptions)
+	return pods, err
+}
